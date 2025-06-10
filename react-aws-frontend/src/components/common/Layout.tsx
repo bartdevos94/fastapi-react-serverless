@@ -7,7 +7,7 @@ import { ToastContainer } from '@/components/ui/Toast'
 import { LoadingOverlay } from '@/components/ui/LoadingSpinner'
 import { useAppSelector } from '@/store'
 
-export const Layout: React.FC = () => {
+export function Layout(): React.JSX.Element {
   const overlayLoading = useAppSelector((state) => state.ui.loading.overlay)
 
   return (

@@ -1,13 +1,11 @@
-// vite.config.ts
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import path from 'path'
 
 export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': '/src',
     },
   },
   server: {
@@ -31,6 +29,9 @@ export default defineConfig({
           aws: ['amazon-cognito-identity-js', '@aws-sdk/client-s3'],
         },
       },
+            input: {
+        main: './index.html'
+      }
     },
   },
   define: {
