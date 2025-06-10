@@ -2,6 +2,8 @@
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
+from pydantic import Field
+from typing import Dict
 
 
 class FileUploadResponse(BaseModel):
@@ -26,7 +28,7 @@ class PresignedUrlRequest(BaseModel):
     """Presigned URL request model."""
     file_key: str
     expiration: int = Field(default=3600, ge=1, le=604800)  # 1 second to 7 days
-    operation: str = Field(default="get_object", regex="^(get_object|put_object)$")
+    operation: str = Field(default="get_object", pattern="^(get_object|put_object)$")
 
 
 class PresignedUrlResponse(BaseModel):

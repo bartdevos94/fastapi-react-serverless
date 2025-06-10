@@ -29,7 +29,7 @@ class CognitoAuthService:
         
         # JWK client for token verification
         jwks_url = f"https://cognito-idp.{settings.COGNITO_REGION}.amazonaws.com/{self.user_pool_id}/.well-known/jwks.json"
-        self.jwks_client = PyJWKClient(jwks_url, cache_ttl=300)
+        self.jwks_client = PyJWKClient(jwks_url)
     
     def _calculate_secret_hash(self, username: str) -> str:
         """Calculate secret hash for Cognito operations."""

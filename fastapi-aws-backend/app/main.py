@@ -11,9 +11,9 @@ def create_app() -> FastAPI:
         title=settings.PROJECT_NAME,
         version=settings.VERSION,
         description=settings.DESCRIPTION,
-        openapi_url=f"{settings.API_V1_STR}/openapi.json" if settings.ENVIRONMENT != "production" else None,
-        docs_url=f"{settings.API_V1_STR}/docs" if settings.ENVIRONMENT != "production" else None,
-        redoc_url=f"{settings.API_V1_STR}/redoc" if settings.ENVIRONMENT != "production" else None,
+        openapi_url=f"/openapi.json" if settings.ENVIRONMENT != "production" else None,
+        docs_url=f"/docs" if settings.ENVIRONMENT != "production" else None,
+        redoc_url=f"/redoc" if settings.ENVIRONMENT != "production" else None,
     )
 
     # CORS middleware

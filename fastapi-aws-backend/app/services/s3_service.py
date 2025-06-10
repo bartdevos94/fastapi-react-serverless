@@ -3,6 +3,9 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from typing import Optional, Dict, Any, BinaryIO
 import uuid
 from datetime import datetime, timedelta
+from typing import List
+from app.models.file import FileUploadResponse, FileMetadata, PresignedUrlRequest, PresignedUrlResponse
+from typing import Dict
 
 from app.core.config import settings
 from app.utils.cache import lru_ttl_cache
@@ -80,13 +83,6 @@ class S3Service:
             raise
 
 
-# Global S3 service instance
-s3_service = S3Service():
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                return None
-            print(f"Error downloading file from S3: {e}")
-            raise
-    
     async def delete_file(self, key: str) -> bool:
         """
         Delete file from S3.
@@ -223,4 +219,8 @@ s3_service = S3Service():
             
             return files
             
-        except ClientError as e
+        except ClientError as e:
+            print(f"Error listing files in S3: {e}")
+            raise
+
+s3_service = S3Service()
