@@ -165,6 +165,7 @@ After creation:
    - **Partition key**: `user_id` (String)
    - **Keep all other defaults**
 4. **Click "Create table"**
+5. **Select Table -> Indexes -> Create GSI (partition key = "email")
 
 ✅ **Verification**: Table should show "Active" status after a few minutes
 
