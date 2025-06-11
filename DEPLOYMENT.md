@@ -223,6 +223,53 @@ After creation:
    - **Handler**: `app.main.handler`
    - **Timeout**: 30 seconds
 4. **Click "Save"**
+### **4.6 Create IAM User and Attach Permissions**
+
+1. **Open the IAM Console**: https://console.aws.amazon.com/iam/
+2. **Go to "Users" → "Add users"**
+3. **Set user name**: e.g., `my-app-backend-user`
+4. **Select "Provide user access to the AWS Management Console"** (optional, for programmatic access only, skip console access)
+5. **On "Set permissions" step, choose "Attach policies directly"**
+6. **Click "Create policy"** and use the following JSON (adjust resources for stricter security):
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "AppAccess",
+         "Effect": "Allow",
+         "Action": [
+           "s3:PutObject",
+           "s3:GetObject",
+           "s3:DeleteObject",
+           "dynamodb:BatchGetItem",
+           "dynamodb:PutItem",
+           "dynamodb:DeleteItem",
+           "dynamodb:GetItem",
+           "dynamodb:Query",
+           "dynamodb:UpdateItem"
+         ],
+         "Resource": "*"
+       }
+     ]
+   }
+   ```
+
+   > 💡 **Tip:** For stricter security, specify only the S3 buckets and DynamoDB tables created for this app instead of `"Resource": "*"`.
+
+7. **Name the policy**: e.g., `fastapi-app-policy`, then **create the policy**
+8. **Back in the user creation tab, attach your new policy** to the user
+9. **Complete user creation**
+10. **Select the new user → "Security credentials" → "Create access key"**
+    - **Use "Other" as the use case**
+    - **Download or copy the Access Key ID and Secret Access Key** (you won't be able to see the secret again)
+11. **Store these keys securely** (e.g., in your `.env` file or GitHub secrets)
+
+---
+
+
+
 
 ### **4.6 Update IAM Permissions**
 
@@ -234,6 +281,7 @@ After creation:
    - `AmazonCognitoPowerUser`
    - `AmazonS3FullAccess`
 5. **Click "Attach policies"**
+ 
 
 ✅ **Verification**: Test your function with a simple test event
 
