@@ -1,0 +1,833 @@
+name: Deploy React Frontend
+
+on:
+  push:
+    branches:
+      - main        # Production deployment
+      - develop     # Development deployment
+    paths:
+      - 'react-aws-frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'react-aws-frontend/**'
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  NODE_VERSION: '18'
+  AWS_REGION: us-east-1
+
+jobs:
+  # Job 2: Build
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    defaults:
+      run:
+        working-directory: ./react-aws-frontend
+    
+    strategy:
+      matrix:
+        environment:
+          - ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+    
+    outputs:
+      artifact-name: ${{ steps.build.outputs.artifact-name }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: './react-aws-frontend/package-lock.json'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Create environment file
+        run: |
+          if [ "${{ matrix.environment }}" = "prod" ]; then
+            cat > .env.production << EOF
+          VITE_API_URL=${{ vars.API_GATEWAY_URL_PROD }}
+          VITE_AWS_REGION=${{ env.AWS_REGION }}
+          VITE_COGNITO_USER_POOL_ID=${{ secrets.COGNITO_USER_POOL_ID_PROD }}
+          VITE_COGNITO_CLIENT_ID=${{ secrets.COGNITO_CLIENT_ID_PROD }}
+          VITE_APP_NAME=FastAPI React App
+          VITE_APP_VERSION=${{ github.sha }}
+          VITE_ENVIRONMENT=production
+          EOF
+          else
+            cat > .env.development << EOF
+          VITE_API_URL=${{ vars.API_GATEWAY_URL_DEV }}
+          VITE_AWS_REGION=${{ env.AWS_REGION }}
+          VITE_COGNITO_USER_POOL_ID=${{ secrets.COGNITO_USER_POOL_ID_DEV }}
+          VITE_COGNITO_CLIENT_ID=${{ secrets.COGNITO_CLIENT_ID_DEV }}
+          VITE_APP_NAME=FastAPI React App (Dev)
+          VITE_APP_VERSION=${{ github.sha }}
+          VITE_ENVIRONMENT=development
+          EOF
+          fi
+
+      - name: Build application
+        id: build
+        run: |
+          npm run build
+          echo "artifact-name=frontend-build-${{ matrix.environment }}" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-build-${{ matrix.environment }}-${{ github.sha }}
+          path: ./react-aws-frontend/dist/
+          retention-days: 30
+
+      - name: Analyze bundle size
+        run: |
+          # Install bundle analyzer
+          npm install --save-dev vite-bundle-analyzer
+          
+          # Generate bundle analysis
+          npm run build -- --analyze || echo "Bundle analysis not available"
+
+  # Job 3: Deploy to Development
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: |
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    environment: development
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build-dev-${{ github.sha }}
+          path: ./dist
+
+      - name: Deploy to S3
+        run: |
+          # Sync files to S3 bucket
+          aws s3 sync ./dist/ s3://${{ vars.S3_FRONTEND_BUCKET_DEV }}/ \
+            --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "*.html" \
+            --exclude "service-worker.js" \
+            --exclude "manifest.json"
+          
+          # Upload HTML files with shorter cache
+          aws s3 sync ./dist/ s3://${{ vars.S3_FRONTEND_BUCKET_DEV }}/ \
+            --delete \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --include "*.html" \
+            --include "service-worker.js" \
+            --include "manifest.json"
+
+      - name: Invalidate CloudFront cache
+        if: vars.CLOUDFRONT_DISTRIBUTION_ID_DEV
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_DEV }} \
+            --paths "/*"
+
+      - name: Test deployment
+        run: |
+          # Wait for deployment to propagate
+          sleep 30
+          
+          # Test if the site is accessible
+          SITE_URL="${{ vars.FRONTEND_URL_DEV }}"
+          
+          if curl -f -s "$SITE_URL" > /dev/null; then
+            echo "✅ Frontend is accessible at $SITE_URL"
+          else
+            echo "❌ Frontend is not accessible at $SITE_URL"
+            exit 1
+          fi
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "🚀 Development frontend deployment successful!"
+            echo "URL: ${{ vars.FRONTEND_URL_DEV }}"
+          else
+            echo "❌ Development frontend deployment failed!"
+          fi
+
+  # Job 4: Deploy to Production
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod')
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build-prod-${{ github.sha }}
+          path: ./dist
+
+      - name: Deploy to S3
+        run: |
+          # Sync files to S3 bucket
+          aws s3 sync ./dist/ s3://${{ vars.S3_FRONTEND_BUCKET_PROD }}/ \
+            --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "*.html" \
+            --exclude "service-worker.js" \
+            --exclude "manifest.json"
+          
+          # Upload HTML files with shorter cache
+          aws s3 sync ./dist/ s3://${{ vars.S3_FRONTEND_BUCKET_PROD }}/ \
+            --delete \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --include "*.html" \
+            --include "service-worker.js" \
+            --include "manifest.json"
+
+      - name: Invalidate CloudFront cache
+        if: vars.CLOUDFRONT_DISTRIBUTION_ID_PROD
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_PROD }} \
+            --paths "/*"
+
+      - name: Test deployment
+        run: |
+          # Wait for deployment to propagate
+          sleep 30
+          
+          # Test if the site is accessible
+          SITE_URL="${{ vars.FRONTEND_URL_PROD }}"
+          
+          if curl -f -s "$SITE_URL" > /dev/null; then
+            echo "✅ Frontend is accessible at $SITE_URL"
+          else
+            echo "❌ Frontend is not accessible at $SITE_URL"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: frontend-v${{ github.run_number }}
+          release_name: Frontend Release v${{ github.run_number }}
+          body: |
+            ## Frontend Release v${{ github.run_number }}
+            
+            **Deployed to Production** 🚀
+            
+            ### Changes
+            - ${{ github.event.head_commit.message }}
+            
+            ### Deployment Details
+            - **Environment**: Production
+            - **Commit**: ${{ github.sha }}
+            - **Frontend URL**: ${{ vars.FRONTEND_URL_PROD }}
+            - **CloudFront**: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_PROD }}
+            
+          draft: false
+          prerelease: false
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "🚀 Production frontend deployment successful!"
+            echo "URL: ${{ vars.FRONTEND_URL_PROD }}"
+          else
+            echo "❌ Production frontend deployment failed!"
+          fi
+
+  # Job 5: Lighthouse Performance Tests
+  lighthouse:
+    name: Lighthouse Performance Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: |
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Lighthouse CI
+        uses: treosh/lighthouse-ci-action@v10
+        with:
+          urls: |
+            ${{ vars.FRONTEND_URL_DEV }}
+            ${{ vars.FRONTEND_URL_DEV }}/login
+            ${{ vars.FRONTEND_URL_DEV }}/signup
+          configPath: './react-aws-frontend/lighthouse.config.js'
+          uploadArtifacts: true
+          temporaryPublicStorage: true
+
+      - name: Upload Lighthouse results
+        uses: actions/upload-artifact@v3
+        with:
+          name: lighthouse-results
+          path: .lighthouseci/
+
+  # Job 6: End-to-End Tests
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: |
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Playwright
+        run: |
+          cd react-aws-frontend
+          npm ci
+          npx playwright install chromium
+
+      - name: Run E2E tests
+        run: |
+          cd react-aws-frontend
+          npm run test:e2e
+        env:
+          BASE_URL: ${{ vars.FRONTEND_URL_DEV }}
+          API_URL: ${{ vars.API_GATEWAY_URL_DEV }}
+
+      - name: Upload E2E test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: e2e-test-results
+          path: |
+            ./react-aws-frontend/test-results/
+            ./react-aws-frontend/playwright-report/
+
+  # Job 7: Security Scan
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    defaults:
+      run:
+        working-directory: ./react-aws-frontend
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Run npm audit
+        run: |
+          npm audit --audit-level=moderate
+
+      - name: Check for known vulnerabilities
+        run: |
+          npx audit-ci --moderate
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-reports-frontend
+          path: |
+            ./react-aws-frontend/audit-results.json
+
+  # Job 8: Accessibility Tests
+  accessibility-tests:
+    name: Accessibility Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: |
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          cd react-aws-frontend
+          npm ci
+
+      - name: Run accessibility tests with axe
+        run: |
+          cd react-aws-frontend
+          npm run test:a11y
+        env:
+          BASE_URL: ${{ vars.FRONTEND_URL_DEV }}
+
+      - name: Upload accessibility results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: accessibility-results
+          path: |
+            ./react-aws-frontend/accessibility-report/
+
+  # Job 9: Visual Regression Tests
+  visual-regression:
+    name: Visual Regression Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: |
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          cd react-aws-frontend
+          npm ci
+
+      - name: Run visual regression tests
+        run: |
+          cd react-aws-frontend
+          npm run test:visual
+        env:
+          BASE_URL: ${{ vars.FRONTEND_URL_DEV }}
+
+      - name: Upload visual test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: visual-regression-results
+          path: |
+            ./react-aws-frontend/visual-test-results/
+
+  # Job 10: SEO and Meta Tags Tests
+  seo-tests:
+    name: SEO and Meta Tags Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: |
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test SEO meta tags
+        run: |
+          # Test homepage meta tags
+          response=$(curl -s "${{ vars.FRONTEND_URL_DEV }}")
+          
+          # Check for essential meta tags
+          if echo "$response" | grep -q "<title>"; then
+            echo "✅ Title tag found"
+          else
+            echo "❌ Title tag missing"
+            exit 1
+          fi
+          
+          if echo "$response" | grep -q 'meta name="description"'; then
+            echo "✅ Description meta tag found"
+          else
+            echo "❌ Description meta tag missing"
+            exit 1
+          fi
+          
+          if echo "$response" | grep -q 'meta property="og:'; then
+            echo "✅ Open Graph tags found"
+          else
+            echo "❌ Open Graph tags missing"
+          fi
+
+      - name: Test robots.txt and sitemap
+        run: |
+          # Test robots.txt
+          if curl -f -s "${{ vars.FRONTEND_URL_DEV }}/robots.txt" > /dev/null; then
+            echo "✅ robots.txt accessible"
+          else
+            echo "⚠️ robots.txt not found (optional)"
+          fi
+          
+          # Test sitemap.xml
+          if curl -f -s "${{ vars.FRONTEND_URL_DEV }}/sitemap.xml" > /dev/null; then
+            echo "✅ sitemap.xml accessible"
+          else
+            echo "⚠️ sitemap.xml not found (optional)"
+          fi
+
+  # Job 11: Mobile Performance Tests
+  mobile-tests:
+    name: Mobile Performance Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: |
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test mobile responsiveness
+        run: |
+          # Test different viewport sizes
+          viewports=("375x667" "414x896" "360x640" "768x1024")
+          
+          for viewport in "${viewports[@]}"; do
+            echo "Testing viewport: $viewport"
+            
+            # Use headless browser to test responsive design
+            # This is a simplified version - you'd use Playwright/Puppeteer
+            echo "✅ Viewport $viewport would be tested here"
+          done
+
+      - name: Test PWA manifest
+        run: |
+          # Test PWA manifest
+          if curl -f -s "${{ vars.FRONTEND_URL_DEV }}/manifest.json" > /dev/null; then
+            echo "✅ PWA manifest accessible"
+            
+            # Validate manifest structure
+            manifest=$(curl -s "${{ vars.FRONTEND_URL_DEV }}/manifest.json")
+            if echo "$manifest" | grep -q '"name"'; then
+              echo "✅ Manifest has required name field"
+            else
+              echo "❌ Manifest missing name field"
+              exit 1
+            fi
+          else
+            echo "❌ PWA manifest not found"
+            exit 1
+          fi
+
+  # Job 12: Deployment Summary
+  deployment-summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-prod]
+    if: always() && (needs.deploy-dev.result == 'success' || needs.deploy-prod.result == 'success')
+    
+    steps:
+      - name: Generate deployment summary
+        run: |
+          echo "## 🚀 Frontend Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.deploy-dev.result }}" = "success" ]; then
+            echo "### ✅ Development Environment" >> $GITHUB_STEP_SUMMARY
+            echo "- **URL**: ${{ vars.FRONTEND_URL_DEV }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **S3 Bucket**: ${{ vars.S3_FRONTEND_BUCKET_DEV }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **CloudFront**: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_DEV }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.deploy-prod.result }}" = "success" ]; then
+            echo "### ✅ Production Environment" >> $GITHUB_STEP_SUMMARY
+            echo "- **URL**: ${{ vars.FRONTEND_URL_PROD }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **S3 Bucket**: ${{ vars.S3_FRONTEND_BUCKET_PROD }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **CloudFront**: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID_PROD }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### 📊 Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Unit Tests**: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build**: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Lighthouse**: ${{ needs.lighthouse.result || 'Skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **E2E Tests**: ${{ needs.e2e-tests.result || 'Skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### 📝 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Test the deployed application" >> $GITHUB_STEP_SUMMARY
+          echo "2. Monitor performance metrics" >> $GITHUB_STEP_SUMMARY
+          echo "3. Check CloudWatch logs for any issues" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify teams (optional)
+        if: vars.SLACK_WEBHOOK_URL
+        run: |
+          # Send Slack notification (if webhook configured)
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"🚀 Frontend deployment completed for ${{ github.ref_name }}!\",
+              \"attachments\": [
+                {
+                  \"color\": \"good\",
+                  \"fields\": [
+                    {
+                      \"title\": \"Environment\",
+                      \"value\": \"${{ github.ref == 'refs/heads/main' && 'Production' || 'Development' }}\",
+                      \"short\": true
+                    },
+                    {
+                      \"title\": \"URL\",
+                      \"value\": \"${{ github.ref == 'refs/heads/main' && vars.FRONTEND_URL_PROD || vars.FRONTEND_URL_DEV }}\",
+                      \"short\": true
+                    }
+                  ]
+                }
+              ]
+            }" \
+            ${{ vars.SLACK_WEBHOOK_URL }}
+
+# Required Configuration Files:
+# ==============================
+
+# react-aws-frontend/lighthouse.config.js
+# -----------------------------------------
+# module.exports = {
+#   ci: {
+#     collect: {
+#       url: ['http://localhost:3000', 'http://localhost:3000/login'],
+#       startServerCommand: 'npm run preview',
+#       startServerReadyPattern: 'Local:',
+#       numberOfRuns: 3,
+#     },
+#     assert: {
+#       preset: 'lighthouse:recommended',
+#       assertions: {
+#         'categories:performance': ['warn', { minScore: 0.8 }],
+#         'categories:accessibility': ['error', { minScore: 0.9 }],
+#         'categories:best-practices': ['warn', { minScore: 0.8 }],
+#         'categories:seo': ['warn', { minScore: 0.8 }],
+#       },
+#     },
+#     upload: {
+#       target: 'temporary-public-storage',
+#     },
+#   },
+# };
+
+# react-aws-frontend/playwright.config.ts
+# ----------------------------------------
+# import { defineConfig, devices } from '@playwright/test';
+# 
+# export default defineConfig({
+#   testDir: './tests',
+#   fullyParallel: true,
+#   forbidOnly: !!process.env.CI,
+#   retries: process.env.CI ? 2 : 0,
+#   workers: process.env.CI ? 1 : undefined,
+#   reporter: 'html',
+#   use: {
+#     baseURL: process.env.BASE_URL || 'http://localhost:3000',
+#     trace: 'on-first-retry',
+#   },
+#   projects: [
+#     {
+#       name: 'chromium',
+#       use: { ...devices['Desktop Chrome'] },
+#     },
+#     {
+#       name: 'firefox',
+#       use: { ...devices['Desktop Firefox'] },
+#     },
+#     {
+#       name: 'webkit',
+#       use: { ...devices['Desktop Safari'] },
+#     },
+#     {
+#       name: 'Mobile Chrome',
+#       use: { ...devices['Pixel 5'] },
+#     },
+#   ],
+#   webServer: {
+#     command: 'npm run preview',
+#     port: 3000,
+#   },
+# });
+
+# package.json additional scripts:
+# ---------------------------------
+# {
+#   "scripts": {
+#     "test:e2e": "playwright test",
+#     "test:a11y": "axe-core tests/accessibility",
+#     "test:visual": "playwright test --config=visual.config.ts",
+#     "test:coverage": "vitest run --coverage",
+#     "lighthouse": "lighthouse-ci",
+#     "format:check": "prettier --check src/**/*.{ts,tsx}",
+#     "type-check": "tsc --noEmit"
+#   }
+# }
+
+# Required GitHub Repository Settings:
+# =====================================
+# 
+# Repository Secrets (Settings > Secrets and variables > Actions):
+# - AWS_ACCESS_KEY_ID: Your AWS access key
+# - AWS_SECRET_ACCESS_KEY: Your AWS secret key
+# - COGNITO_USER_POOL_ID_DEV: Development Cognito User Pool ID
+# - COGNITO_CLIENT_ID_DEV: Development Cognito Client ID
+# - COGNITO_USER_POOL_ID_PROD: Production Cognito User Pool ID
+# - COGNITO_CLIENT_ID_PROD: Production Cognito Client ID
+# 
+# Repository Variables (Settings > Secrets and variables > Actions):
+# - S3_FRONTEND_BUCKET_DEV: my-app-frontend-dev-123456789
+# - S3_FRONTEND_BUCKET_PROD: my-app-frontend-prod-123456789
+# - CLOUDFRONT_DISTRIBUTION_ID_DEV: E1234567890ABC
+# - CLOUDFRONT_DISTRIBUTION_ID_PROD: E1234567890ABC
+# - FRONTEND_URL_DEV: https://dev.d1234567890.cloudfront.net
+# - FRONTEND_URL_PROD: https://d1234567890.cloudfront.net
+# - API_GATEWAY_URL_DEV: https://xxx.execute-api.us-east-1.amazonaws.com/dev
+# - API_GATEWAY_URL_PROD: https://xxx.execute-api.us-east-1.amazonaws.com/prod
+# - SLACK_WEBHOOK_URL: https://hooks.slack.com/services/... (optional)
+# 
+# Environment Protection Rules (Settings > Environments):
+# - development: Auto-deploy from develop branch
+# - production: Require manual approval for main branch
+# 
+# Branch Protection Rules (Settings > Branches):
+# - main: Require PR reviews, require status checks
+# - develop: Require status checks
+#
+# Additional Setup Steps:
+# =======================
+# 1. Deploy your infrastructure manually via AWS Console first
+# 2. Add all the required secrets and variables to GitHub
+# 3. Create lighthouse.config.js in react-aws-frontend/
+# 4. Set up Playwright configuration and tests
+# 5. Install required dev dependencies:
+#    npm install --save-dev @playwright/test lighthouse-ci axe-core
+# 6. Create test directories and configuration files
+# 7. Push code to develop/main branches to trigger deployments
+#
+# Optional Integrations:
+# ======================
+# - Slack notifications for deployment status
+# - Datadog/New Relic for performance monitoring
+# - Sentry for error tracking
+# - CodeClimate for code quality metrics
+# - Dependabot for dependency updates1: Test and Lint
+  test:
+    name: Test and Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./react-aws-frontend
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: './react-aws-frontend/package-lock.json'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Lint with ESLint
+        run: |
+          npm run lint
+
+      - name: Type check with TypeScript
+        run: |
+          npm run type-check
+
+      - name: Format check with Prettier
+        run: |
+          npm run format:check
+
+      - name: Run tests
+        run: |
+          npm run test:coverage
+        env:
+          # Test environment variables
+          VITE_API_URL: http://localhost:8000
+          VITE_AWS_REGION: us-east-1
+          VITE_COGNITO_USER_POOL_ID: test-pool-id
+          VITE_COGNITO_CLIENT_ID: test-client-id
+
+      - name: Upload coverage to Codecov
+        if: github.event_name == 'push'
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./react-aws-frontend/coverage/coverage-final.json
+          flags: frontend
+          name: frontend-coverage
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-frontend
+          path: |
+            ./react-aws-frontend/coverage/
+            ./react-aws-frontend/test-results/
+
+  # Job

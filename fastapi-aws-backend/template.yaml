@@ -1,0 +1,385 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  FastAPI Backend Application
+  
+  SAM template for deploying FastAPI application to AWS Lambda with API Gateway,
+  Cognito authentication, and DynamoDB storage. This template is provided as a 
+  reference - the recommended deployment method is manual console setup.
+
+# Template Parameters
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+  
+  ProjectName:
+    Type: String
+    Default: fastapi-react-app
+    Description: Name of the project (used for resource naming)
+  
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID (created manually via console)
+    Default: ""
+  
+  CognitoClientId:
+    Type: String
+    Description: Cognito User Pool Client ID (created manually via console)
+    Default: ""
+
+# Global Configuration
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.11
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        AWS_REGION: !Ref AWS::Region
+        DYNAMODB_TABLE_NAME: !Ref UsersTable
+        COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+        COGNITO_CLIENT_ID: !Ref CognitoClientId
+        CORS_ORIGINS: "https://localhost:3000"
+  
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: "'*'"
+
+# Resources
+Resources:
+  # Lambda Function for FastAPI Application
+  FastAPIFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-backend-${Environment}"
+      CodeUri: app/
+      Handler: main.handler
+      Description: FastAPI backend application for user management and file upload
+      Environment:
+        Variables:
+          LOG_LEVEL: !If [IsProd, "WARNING", "INFO"]
+      Events:
+        ProxyAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FastAPIGateway
+            Path: /{proxy+}
+            Method: ANY
+        RootAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FastAPIGateway
+            Path: /
+            Method: ANY
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:*
+              Resource: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*"
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+
+  # API Gateway
+  FastAPIGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api-${Environment}"
+      StageName: !Ref Environment
+      Description: API Gateway for FastAPI backend
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: !If [IsProd, true, false]
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: !If [IsProd, "ERROR", "INFO"]
+          DataTraceEnabled: !If [IsProd, false, true]
+          MetricsEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+        MaxAge: "'600'"
+
+  # DynamoDB Table for User Data
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-users-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for File Storage
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-files-${Environment}-${AWS::AccountId}"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedOrigins:
+              - "*"
+            MaxAge: 3600
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: !If [IsProd, "Enabled", "Suspended"]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: DeleteOldVersions
+            Status: !If [IsProd, "Enabled", "Disabled"]
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for Lambda Function
+  FastAPILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-backend-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # IAM Role for Lambda Function (explicit definition)
+  FastAPIExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-execution-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !Sub "${UsersTable.Arn}/index/*"
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GeneratePresignedUrl
+                Resource:
+                  - !Sub "${FilesBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FilesBucket.Arn
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminDeleteUser
+                  - cognito-idp:AdminUpdateUserAttributes
+                  - cognito-idp:ListUsers
+                Resource:
+                  - !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*"
+
+# Conditions
+Conditions:
+  IsProd: !Equals [!Ref Environment, "prod"]
+  IsStaging: !Equals [!Ref Environment, "staging"]
+  IsDev: !Equals [!Ref Environment, "dev"]
+
+# Outputs
+Outputs:
+  # API Gateway URL
+  APIGatewayURL:
+    Description: "API Gateway endpoint URL for FastAPI application"
+    Value: !Sub "https://${FastAPIGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${ProjectName}-api-url-${Environment}"
+
+  # Lambda Function ARN
+  FastAPIFunctionArn:
+    Description: "FastAPI Lambda Function ARN"
+    Value: !GetAtt FastAPIFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-lambda-arn-${Environment}"
+
+  # DynamoDB Table Name
+  UsersTableName:
+    Description: "DynamoDB Users Table Name"
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub "${ProjectName}-users-table-${Environment}"
+
+  # S3 Bucket for Files
+  FilesBucketName:
+    Description: "S3 Bucket for file storage"
+    Value: !Ref FilesBucket
+    Export:
+      Name: !Sub "${ProjectName}-files-bucket-${Environment}"
+
+  # CloudWatch Log Group
+  LogGroupName:
+    Description: "CloudWatch Log Group for Lambda function"
+    Value: !Ref FastAPILogGroup
+    Export:
+      Name: !Sub "${ProjectName}-log-group-${Environment}"
+
+  # API Gateway ID
+  APIGatewayId:
+    Description: "API Gateway ID"
+    Value: !Ref FastAPIGateway
+    Export:
+      Name: !Sub "${ProjectName}-api-id-${Environment}"
+
+  # Stack Information
+  StackName:
+    Description: "CloudFormation Stack Name"
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub "${ProjectName}-stack-name-${Environment}"
+
+  Region:
+    Description: "AWS Region"
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${ProjectName}-region-${Environment}"
+
+# Metadata
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: fastapi-react-backend
+    Description: FastAPI backend application with AWS Lambda, API Gateway, and DynamoDB
+    Author: FastAPI React Team
+    SpdxLicenseId: MIT
+    LicenseUrl: ../LICENSE
+    ReadmeUrl: ../README.md
+    Labels: ['fastapi', 'python', 'aws', 'lambda', 'api-gateway', 'dynamodb']
+    HomePageUrl: https://github.com/yourusername/fastapi-react-fullstack
+    SemanticVersion: 1.0.0
+    SourceCodeUrl: https://github.com/yourusername/fastapi-react-fullstack
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Cognito Configuration"
+        Parameters:
+          - CognitoUserPoolId
+          - CognitoClientId
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      CognitoUserPoolId:
+        default: "Cognito User Pool ID"
+      CognitoClientId:
+        default: "Cognito Client ID"
+
+# Template Notes:
+# ================
+# 
+# This SAM template is provided as a REFERENCE for infrastructure as code.
+# The RECOMMENDED deployment method is manual console setup as described 
+# in DEPLOYMENT.md.
+#
+# To use this template:
+# 1. First create Cognito User Pool manually via AWS Console
+# 2. Update the parameters with your Cognito IDs
+# 3. Deploy using: sam build && sam deploy --guided
+#
+# Manual console deployment provides:
+# - Better learning experience
+# - Easier troubleshooting
+# - No CLI dependencies
+# - Visual feedback
+# - Step-by-step validation
+#
+# This template is useful for:
+# - Understanding AWS resource relationships
+# - Infrastructure as code reference
+# - Automated deployments (advanced users)
+# - CI/CD pipelines
